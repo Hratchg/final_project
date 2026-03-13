@@ -1,0 +1,129 @@
+---
+title: "Codebook — League of Legends Classification Project"
+author: "PSTAT 131/231 Final Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+library(knitr)
+```
+
+# Overview
+
+This codebook describes every column in the final modeling dataset for the
+League of Legends win/loss classification project.
+
+**Data source:**
+
+> Paololol. (2018). *League of Legends Ranked Matches.* Kaggle.
+> <https://www.kaggle.com/datasets/paololol/league-of-legends-ranked-matches>
+
+The modeling table is created by merging `matches.csv`, `teamstats.csv`,
+`stats1.csv`, `stats2.csv`, and `participants.csv`. Each row represents
+**one team in one match**.
+
+```{r load-data}
+prepared_path <- here("data", "prepared_data.csv")
+if (file.exists(prepared_path)) {
+  clean <- read_csv(prepared_path, show_col_types = FALSE)
+} else {
+  stop("Run the report first to generate prepared_data.csv")
+}
+```
+
+# Target Variable
+
+| Field | Value |
+|-------|-------|
+| **Column** | `win` |
+| **Type** | Integer (0/1), converted to Factor for modeling |
+| **Values** | `1` = Win, `0` = Loss |
+| **Description** | Whether the team won the match |
+
+# Match-Level Variables
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `duration` | Integer | Match duration in seconds |
+| `seasonid` | Integer | Riot Games ranked season identifier |
+
+# Team Objective Variables (from `teamstats.csv`)
+
+| Column | Type | Values | Description |
+|--------|------|--------|-------------|
+| `firstblood` | Binary | 0, 1 | 1 = team scored first kill of the match |
+| `firsttower` | Binary | 0, 1 | 1 = team destroyed first tower |
+| `firstinhib` | Binary | 0, 1 | 1 = team destroyed first inhibitor |
+| `firstbaron` | Binary | 0, 1 | 1 = team killed Baron Nashor first |
+| `firstdragon` | Binary | 0, 1 | 1 = team killed first dragon |
+| `firstharry` | Binary | 0, 1 | 1 = team killed first Rift Herald ("Harry" internally) |
+| `towerkills` | Integer | 0--11 | Enemy towers destroyed |
+| `inhibkills` | Integer | 0+ | Enemy inhibitors destroyed |
+| `baronkills` | Integer | 0+ | Baron Nashor kills |
+| `dragonkills` | Integer | 0+ | Dragons slain |
+| `harrykills` | Integer | 0+ | Rift Heralds killed |
+
+# Aggregated Player Statistics (summed across 5 team members)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `team_kills` | Integer | Total kills |
+| `team_deaths` | Integer | Total deaths |
+| `team_assists` | Integer | Total assists |
+| `team_largestkillingspree` | Integer | Sum of each player's largest killing spree |
+| `team_totdmgdealt` | Integer | Total damage to all targets |
+| `team_totdmgtochamp` | Integer | Total damage to enemy champions |
+| `team_totdmgtaken` | Integer | Total damage received |
+| `team_totheal` | Integer | Total healing done |
+| `team_dmgtoobj` | Integer | Total damage to objectives |
+| `team_dmgtoturrets` | Integer | Total damage to turrets |
+| `team_goldearned` | Integer | Total gold earned |
+| `team_goldspent` | Integer | Total gold spent on items |
+| `team_totminionskilled` | Integer | Total lane minions killed (CS) |
+| `team_neutralminionskilled` | Integer | Total jungle monsters killed |
+| `team_wardsplaced` | Integer | Total wards placed |
+| `team_wardskilled` | Integer | Total enemy wards destroyed |
+| `team_turretkills` | Integer | Turret kills by individual players |
+| `team_inhibkills` | Integer | Inhibitor kills by individual players |
+| `team_visionscore` | Integer | Total vision score |
+| `team_totcctimedealt` | Integer | Total crowd control time dealt |
+| `team_champlvl` | Integer | Sum of champion levels at game end |
+| `team_pinksbought` | Integer | Total control wards purchased |
+| `team_dmgselfmit` | Integer | Total self-mitigated damage |
+| `team_doublekills` | Integer | Total double kills |
+| `team_triplekills` | Integer | Total triple kills |
+| `team_quadrakills` | Integer | Total quadra kills |
+| `team_pentakills` | Integer | Total penta kills |
+| `avg_champlvl` | Numeric | Average champion level (team mean) |
+
+# Auto-Generated Summary
+
+```{r auto-table}
+codebook <- tibble(
+  Column = names(clean),
+  Type   = sapply(clean, function(x) class(x)[1]),
+  Unique = sapply(clean, n_distinct),
+  Missing = sapply(clean, function(x) sum(is.na(x))),
+  Range = sapply(names(clean), function(col) {
+    x <- clean[[col]]
+    if (is.numeric(x)) paste0("[", round(min(x, na.rm=T),1), ", ", round(max(x, na.rm=T),1), "]")
+    else paste(sort(unique(na.omit(x)))[1:min(5, n_distinct(x))], collapse=", ")
+  })
+)
+kable(codebook, caption = "All Columns — Summary")
+```
+
+# Notes
+
+- **Binary flags** (0/1): `1` = team achieved that objective; `0` = they did not.
+- **"Harry"** is Riot's internal codename for the **Rift Herald**.
+- **Aggregation**: Player stats are summed per team; `avg_champlvl` is the mean.
+- **Missingness**: Imputed in the modeling recipe (median for numeric, mode for categorical).
+- **Leakage prevention**: `matchid`, `teamid`, and any column with "win/loss/result" (other than target) are removed.

@@ -1,0 +1,805 @@
+---
+title: "Predicting Match Outcomes in League of Legends: A Classification Approach"
+author: "PSTAT 131/231 Final Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    fig_width: 8
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", out.width = "90%"
+)
+```
+
+```{r load-libraries, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(vip)
+library(knitr)
+library(here)
+
+tidymodels_prefer()
+```
+
+```{r global-config}
+# ---- Global Configuration ----
+SEED         <- 42
+set.seed(SEED)
+
+DATA_DIR     <- here("data")
+OUTPUT_DIR   <- here("output")
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+TRAIN_PROP   <- 0.75
+CV_FOLDS     <- 10
+RF_TREES     <- 500
+
+GLMNET_GRID  <- 20
+RF_GRID      <- 15
+XGB_GRID     <- 20
+
+# Set to a number (e.g., 50000) for faster test runs; NULL uses all data.
+SAMPLE_N     <- NULL
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+League of Legends (LoL) is one of the most popular competitive online multiplayer games in the world, with millions of ranked matches played each day. In each match, two teams of five players compete to destroy the opposing team's base (the "Nexus"). Along the way, teams earn **gold** by killing enemy players and minions, secure **objectives** like dragons, Baron Nashor, Rift Herald, and towers, and deal **damage** to push toward the enemy base. The team that manages its resources and objectives most effectively typically wins.
+
+The central research question of this project is: **Can we accurately predict whether a team wins or loses a ranked League of Legends match using in-game performance statistics?** Secondarily, we want to understand which in-game factors --- such as gold earned, kills, objective control, and vision --- are the strongest predictors of winning.
+
+This is a **binary classification** problem because the outcome variable can take only two values: Win or Loss. We use four classification models --- logistic regression, elastic net, random forest, and XGBoost --- all implemented in the `tidymodels` framework with cross-validation for hyperparameter tuning and stratified sampling to ensure balanced representation of both classes.
+
+## Data Source and Citation
+
+> **Paololol.** (2018). *League of Legends Ranked Matches.* Kaggle. <https://www.kaggle.com/datasets/paololol/league-of-legends-ranked-matches>
+
+The dataset contains approximately 180,000 ranked matches distributed across six CSV files at different levels of aggregation. We merge them into a single team-level modeling table where each row represents one team in one match, with a binary outcome indicating whether that team won.
+
+------------------------------------------------------------------------
+
+# Data Preparation
+
+A substantial portion of this project involved cleaning, tidying, and combining the raw Kaggle files into a single modeling table. The dataset is distributed across **six CSV files**, each at a different level of aggregation and using different keys. This section documents that integration process.
+
+## Raw File Structure
+
+| File | Level | Key Columns | Contents |
+|----------------|----------------|-----------------------|------------------|
+| `matches.csv` | One row per match | `id` | Duration, season, platform, version |
+| `participants.csv` | One row per player per match | `id`, `matchid`, `player` | Champion, role, summoner spells |
+| `stats1.csv` + `stats2.csv` | One row per player per match | `id` (= participants.id) | Kills, deaths, gold, damage, wards, **win/loss** |
+| `teamstats.csv` | One row per team per match | `matchid`, `teamid` | First blood/tower/dragon/baron flags, objective counts |
+| `champs.csv` | One row per champion | `id` | Champion names (lookup; not used in modeling) |
+
+## Merging Strategy
+
+The files do not share a single common key. Combining them required a multi-step join:
+
+1.  **Combine stats1 + stats2** --- identical schemas split for file size; coerce type mismatches before binding.
+2.  **Join stats to participants** on `participants.id = stats.id`.
+3.  **Derive team IDs** --- players 1--5 = team 100 (blue side); 6--10 = team 200 (red side). Verify each team has exactly 5 players.
+4.  **Extract win/loss** from the per-player `win` column (all 5 on a winning team share `win = 1`).
+5.  **Aggregate player stats** to team level (sum kills, gold, damage, etc.; average champion level).
+6.  **Join team objectives** from `teamstats.csv` on `(matchid, teamid)`.
+7.  **Join match metadata** from `matches.csv` on `matchid` for duration/season.
+8.  **Drop identifiers** (`matchid`, `teamid`) --- they are keys, not predictors.
+
+```{r data-preparation, cache=TRUE}
+PREPARED_FILE <- file.path(DATA_DIR, "prepared_data.csv")
+
+if (file.exists(PREPARED_FILE)) {
+  cat(">> Loading cached prepared data...\n")
+  prepared_data <- read_csv(PREPARED_FILE, show_col_types = FALSE)
+} else {
+  # --- Load raw files ---
+  matches      <- read_csv(file.path(DATA_DIR, "matches.csv"), show_col_types = FALSE)
+  teamstats    <- read_csv(file.path(DATA_DIR, "teamstats.csv"), show_col_types = FALSE)
+  participants <- read_csv(file.path(DATA_DIR, "participants.csv"), show_col_types = FALSE)
+  stats1       <- read_csv(file.path(DATA_DIR, "stats1.csv"), show_col_types = FALSE)
+
+  stats2 <- NULL
+  stats2_path <- file.path(DATA_DIR, "stats2.csv")
+  if (file.exists(stats2_path)) {
+    stats2 <- read_csv(stats2_path, show_col_types = FALSE)
+  }
+
+  cat("matches:", nrow(matches), "| teamstats:", nrow(teamstats),
+      "| participants:", nrow(participants), "| stats1:", nrow(stats1),
+      if (!is.null(stats2)) paste("| stats2:", nrow(stats2)) else "", "\n")
+
+  # --- Combine stats files (fix type mismatches) ---
+  if (!is.null(stats2)) {
+    for (col in intersect(names(stats1), names(stats2))) {
+      if (is.numeric(stats1[[col]]) && !is.numeric(stats2[[col]])) {
+        stats2[[col]] <- suppressWarnings(as.numeric(stats2[[col]]))
+      }
+    }
+    stats_all <- bind_rows(stats1, stats2)
+  } else {
+    stats_all <- stats1
+  }
+  rm(stats1, stats2); gc()
+
+  # --- Join stats to participants ---
+  player_data <- participants %>%
+    select(id, matchid, player) %>%
+    inner_join(stats_all, by = "id") %>%
+    mutate(teamid = if_else(player <= 5, 100L, 200L))
+
+  rm(stats_all, participants); gc()
+
+  # --- Drop incomplete teams (not exactly 5 players) ---
+  team_sizes <- player_data %>% count(matchid, teamid, name = "n_players")
+  valid      <- team_sizes %>% filter(n_players == 5)
+  player_data <- player_data %>% semi_join(valid, by = c("matchid", "teamid"))
+
+  # --- Extract team-level win ---
+  team_win <- player_data %>%
+    group_by(matchid, teamid) %>%
+    summarise(win = max(win, na.rm = TRUE), .groups = "drop")
+
+  # --- Aggregate player stats to team level ---
+  exclude <- c("id", "matchid", "player", "teamid", "win",
+               "item1","item2","item3","item4","item5","item6",
+               "trinket", "firstblood")
+  agg_cols <- names(player_data)[
+    sapply(player_data, is.numeric) & !names(player_data) %in% exclude
+  ]
+
+  team_agg <- player_data %>%
+    group_by(matchid, teamid) %>%
+    summarise(
+      across(all_of(agg_cols), ~ sum(., na.rm = TRUE), .names = "team_{.col}"),
+      avg_champlvl = mean(champlvl, na.rm = TRUE),
+      .groups = "drop"
+    )
+  rm(player_data, team_sizes, valid); gc()
+
+  # --- Join everything ---
+  match_info <- matches %>% select(matchid = id, duration, seasonid)
+
+  prepared_data <- team_win %>%
+    left_join(match_info, by = "matchid") %>%
+    left_join(teamstats, by = c("matchid", "teamid")) %>%
+    left_join(team_agg, by = c("matchid", "teamid")) %>%
+    select(-matchid, -teamid) %>%
+    filter(!is.na(win))
+
+  write_csv(prepared_data, PREPARED_FILE)
+  rm(matches, teamstats, match_info, team_win, team_agg); gc()
+}
+
+cat("Prepared dataset:", nrow(prepared_data), "rows x", ncol(prepared_data), "columns\n")
+```
+
+## Data Leakage Considerations
+
+Data leakage occurs when information that would not be available at prediction time is included as a predictor. Key risks:
+
+-   **Other win/loss columns**: Our pipeline automatically removes any column whose name contains "win," "loss," "result," "victory," or "defeat" (other than the target).
+-   **Post-game aggregates**: Stats like total gold and final tower count reflect the entire game. Ideally we would use only early/mid-game snapshots, but the dataset does not provide time-stamped data. We note this as a limitation.
+
+```{r clean-data}
+TARGET <- "win"
+clean_data <- prepared_data
+
+# Optional: sample for faster runs
+if (!is.null(SAMPLE_N) && SAMPLE_N < nrow(clean_data)) {
+  set.seed(SEED)
+  clean_data <- slice_sample(clean_data, n = SAMPLE_N)
+  cat(">> Sampled to", SAMPLE_N, "rows.\n")
+}
+
+# Convert outcome to factor (1 = Win, 0 = Loss)
+clean_data <- clean_data %>%
+  mutate(!!TARGET := factor(.data[[TARGET]], levels = c(1, 0), labels = c("Win", "Loss")))
+
+# Remove leakage columns (any with "win/loss/result" other than TARGET)
+suspect <- setdiff(
+  grep("win|loss|result|victory|defeat", names(clean_data), ignore.case = TRUE, value = TRUE),
+  TARGET
+)
+if (length(suspect) > 0) {
+  cat("Removing leakage columns:", paste(suspect, collapse = ", "), "\n")
+  clean_data <- clean_data %>% select(-all_of(suspect))
+}
+
+# Remove ID-like character columns
+id_cols <- names(clean_data)[sapply(clean_data, function(x)
+  is.character(x) && n_distinct(x) > 0.9 * nrow(clean_data))]
+if (length(id_cols) > 0) clean_data <- clean_data %>% select(-all_of(id_cols))
+
+# Convert low-cardinality character columns to factors
+clean_data <- clean_data %>%
+  mutate(across(where(~ is.character(.) && n_distinct(.) <= 30), as.factor))
+
+cat("Final modeling data:", nrow(clean_data), "rows x", ncol(clean_data), "columns\n")
+cat("Target:", TARGET, "\n")
+cat("Predictors:", ncol(clean_data) - 1, "\n")
+```
+
+```{r missingness-report}
+miss_summary <- clean_data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(clean_data), 2)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+if (nrow(miss_summary) == 0) {
+  cat("No missing values detected in any column.\n")
+} else {
+  kable(miss_summary, caption = "Columns with missing values")
+}
+```
+
+`r if (nrow(miss_summary) == 0) "The prepared dataset is complete --- no columns contain missing values. Our recipe still includes imputation steps as a safety net for robustness." else paste0("There are ", nrow(miss_summary), " columns with missing values. Our recipe imputes numeric columns with the median and categorical columns with the mode.")`
+
+------------------------------------------------------------------------
+
+# Exploratory Data Analysis
+
+## Outcome Balance
+
+```{r eda-balance, fig.cap="Figure 1: Distribution of the outcome variable (Win vs. Loss)."}
+clean_data %>%
+  ggplot(aes(x = .data[[TARGET]], fill = .data[[TARGET]])) +
+  geom_bar(alpha = 0.85, show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = c("#2166AC", "#B2182B")) +
+  labs(title = "Outcome Class Balance", x = TARGET, y = "Count") +
+  theme_minimal(base_size = 13)
+```
+
+```{r balance-numbers}
+tbl <- table(clean_data[[TARGET]])
+cat("Win:", tbl["Win"], "(", round(100 * tbl["Win"] / sum(tbl), 1), "%)\n")
+cat("Loss:", tbl["Loss"], "(", round(100 * tbl["Loss"] / sum(tbl), 1), "%)\n")
+```
+
+Because each match produces one winning team and one losing team, the classes are perfectly balanced (50/50). This is ideal --- we do not need oversampling or class weights. We still use stratified sampling in all splits.
+
+## Distributions of Key Numeric Predictors
+
+```{r eda-distributions, fig.cap="Figure 2: Histograms of the highest-variance numeric predictors."}
+numeric_preds <- clean_data %>%
+  select(-all_of(TARGET)) %>% select(where(is.numeric)) %>% names()
+
+top_vars <- clean_data %>%
+  select(all_of(numeric_preds)) %>%
+  summarise(across(everything(), ~ var(., na.rm = TRUE))) %>%
+  pivot_longer(everything()) %>% arrange(desc(value)) %>%
+  slice_head(n = min(8, length(numeric_preds))) %>% pull(name)
+
+clean_data %>%
+  select(all_of(top_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#4393C3", color = "white", alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(title = "Distributions of Top Numeric Predictors (by Variance)",
+       x = "Value", y = "Frequency") +
+  theme_minimal(base_size = 11)
+```
+
+Many game statistics follow right-skewed distributions because dominant performances produce extreme values in gold, damage, and kills. Our recipe normalizes all numeric predictors, which is important for logistic regression and elastic net.
+
+## Correlation Heatmap
+
+Multicollinearity is a known concern: gold earned correlates strongly with kills, assists, and CS because those activities generate gold.
+
+```{r eda-corr, fig.cap="Figure 3: Correlation heatmap among numeric predictors."}
+outcome_numeric <- as.numeric(clean_data[[TARGET]]) - 1
+
+corr_vars <- if (length(numeric_preds) > 20) {
+  cors <- sapply(numeric_preds, function(v)
+    abs(cor(clean_data[[v]], outcome_numeric, use = "complete.obs")))
+  names(sort(cors, decreasing = TRUE))[1:20]
+} else { numeric_preds }
+
+corr_mat <- clean_data %>%
+  select(all_of(corr_vars)) %>%
+  cor(use = "pairwise.complete.obs")
+
+corrplot(corr_mat, method = "color", type = "upper", order = "hclust",
+         tl.cex = 0.65, tl.col = "black")
+```
+
+The heatmap reveals clusters of correlated features. Our recipe includes `step_corr(threshold = 0.90)` to remove one member of highly correlated pairs. Elastic net also handles collinearity by shrinking correlated coefficients.
+
+## Top Predictors by Outcome
+
+```{r eda-boxplots, fig.cap="Figure 4: Boxplots of the most outcome-correlated predictors."}
+cors <- sapply(numeric_preds, function(v)
+  abs(cor(clean_data[[v]], outcome_numeric, use = "complete.obs")))
+top6 <- names(sort(cors, decreasing = TRUE))[1:min(6, length(cors))]
+
+clean_data %>%
+  select(all_of(c(TARGET, top6))) %>%
+  pivot_longer(-all_of(TARGET), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = .data[[TARGET]], y = value, fill = .data[[TARGET]])) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  scale_fill_manual(values = c("#2166AC", "#B2182B")) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  labs(title = "Top Predictors by Outcome", x = TARGET, y = "Value") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none")
+```
+
+Winning teams show clearly higher gold earned, more tower kills, and more damage dealt. This separation confirms that our features carry genuine predictive signal for the classification task.
+
+## Summary Statistics
+
+```{r eda-summary-table}
+eda_summary <- clean_data %>%
+  select(all_of(numeric_preds)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(Mean = round(mean(Value, na.rm = TRUE), 1),
+            SD = round(sd(Value, na.rm = TRUE), 1),
+            Median = round(median(Value, na.rm = TRUE), 1),
+            Min = round(min(Value, na.rm = TRUE), 1),
+            Max = round(max(Value, na.rm = TRUE), 1),
+            .groups = "drop") %>%
+  arrange(Variable)
+
+kable(head(eda_summary, 20),
+      caption = "Table 1: Summary statistics for numeric predictors (first 20).")
+```
+
+------------------------------------------------------------------------
+
+# Data Splitting and Cross-Validation
+
+## Splitting the Data
+
+We split the data into **75% training** and **25% test**, stratified on the outcome. The test set is held out entirely until final evaluation --- no model sees it during training or tuning.
+
+```{r data-split}
+set.seed(SEED)
+data_split <- initial_split(clean_data, prop = TRAIN_PROP, strata = all_of(TARGET))
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cat("Training set:", nrow(train_data), "rows\n")
+cat("Test set:    ", nrow(test_data), "rows\n")
+cat("\nTraining outcome distribution:\n")
+print(table(train_data[[TARGET]]))
+```
+
+## Cross-Validation
+
+Within the training set, we use **`r CV_FOLDS`-fold cross-validation** (also stratified on the outcome) to tune hyperparameters and estimate model performance:
+
+1.  The training data is randomly divided into `r CV_FOLDS` equal folds.
+2.  For each fold, the model trains on the other `r CV_FOLDS - 1` folds and is tested on the held-out fold.
+3.  This repeats `r CV_FOLDS` times; metrics are averaged across all folds.
+
+This gives a more stable performance estimate than a single validation split because every observation serves as validation exactly once.
+
+```{r cv-folds}
+set.seed(SEED)
+cv_folds <- vfold_cv(train_data, v = CV_FOLDS, strata = all_of(TARGET))
+```
+
+------------------------------------------------------------------------
+
+# Model Fitting
+
+## Preprocessing Recipe
+
+All four models share a common preprocessing recipe:
+
+1.  **Impute** missing numeric values with median; missing categoricals with mode.
+2.  **Dummy-encode** all categorical predictors.
+3.  **Remove zero-variance** predictors.
+4.  **Remove highly correlated** predictors (\|r\| \> 0.90).
+5.  **Center and scale** all numeric predictors to mean 0, SD 1.
+
+```{r recipe}
+model_formula <- as.formula(paste(TARGET, "~ ."))
+
+base_recipe <- recipe(model_formula, data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.90) %>%
+  step_normalize(all_numeric_predictors())
+
+base_recipe
+```
+
+## Model Specifications
+
+```{r model-specs}
+# Evaluation metrics for all models
+class_metrics <- metric_set(accuracy, roc_auc, sensitivity, specificity)
+
+# Model 1: Logistic Regression (baseline, no tuning)
+logistic_spec <- logistic_reg() %>% set_engine("glm") %>% set_mode("classification")
+
+# Model 2: Elastic Net (tune penalty + mixture)
+glmnet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>% set_mode("classification")
+
+# Model 3: Random Forest (tune mtry + min_n)
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = RF_TREES) %>%
+  set_engine("ranger", importance = "impurity") %>% set_mode("classification")
+
+# Model 4: XGBoost (tune trees, learn_rate, tree_depth, min_n)
+xgb_spec <- boost_tree(trees = tune(), learn_rate = tune(),
+                        tree_depth = tune(), min_n = tune()) %>%
+  set_engine("xgboost") %>% set_mode("classification")
+```
+
+```{r workflows}
+logistic_wf <- workflow() %>% add_recipe(base_recipe) %>% add_model(logistic_spec)
+glmnet_wf   <- workflow() %>% add_recipe(base_recipe) %>% add_model(glmnet_spec)
+rf_wf       <- workflow() %>% add_recipe(base_recipe) %>% add_model(rf_spec)
+xgb_wf      <- workflow() %>% add_recipe(base_recipe) %>% add_model(xgb_spec)
+```
+
+## Model 1: Logistic Regression
+
+Logistic regression models the log-odds of winning as a linear combination of predictors. It is simple, interpretable (coefficients as odds ratios), and serves as our **baseline**.
+
+```{r fit-logistic, cache=TRUE}
+set.seed(SEED)
+logistic_cv <- fit_resamples(logistic_wf, resamples = cv_folds,
+                              metrics = class_metrics,
+                              control = control_resamples(save_pred = TRUE))
+
+collect_metrics(logistic_cv) %>%
+  select(.metric, mean, std_err) %>%
+  kable(caption = "Table 2: Logistic Regression — CV Results", digits = 4)
+```
+
+## Model 2: Elastic Net (Regularized Logistic Regression)
+
+Elastic net adds a penalty that shrinks coefficients, helping with multicollinearity. We tune:
+
+-   **`penalty`** ($\lambda$): strength of regularization.
+-   **`mixture`** ($\alpha$): blend of L1 (lasso) and L2 (ridge). $\alpha = 1$ is pure lasso; $\alpha = 0$ is pure ridge.
+
+```{r fit-glmnet, cache=TRUE}
+set.seed(SEED)
+glmnet_grid <- grid_latin_hypercube(penalty(), mixture(), size = GLMNET_GRID)
+
+set.seed(SEED)
+glmnet_tune <- tune_grid(glmnet_wf, resamples = cv_folds, grid = glmnet_grid,
+                          metrics = class_metrics,
+                          control = control_grid(save_pred = TRUE))
+
+show_best(glmnet_tune, metric = "roc_auc", n = 5) %>%
+  select(penalty, mixture, mean, std_err) %>%
+  kable(caption = "Table 3: Top 5 Elastic Net by ROC AUC", digits = 4)
+```
+
+```{r glmnet-plot, fig.cap="Figure 5: Elastic net tuning results."}
+autoplot(glmnet_tune, metric = "roc_auc") +
+  labs(title = "Elastic Net Tuning: ROC AUC") + theme_minimal()
+```
+
+## Model 3: Random Forest
+
+Random forests build hundreds of decision trees on bootstrapped samples and aggregate their votes. They naturally handle non-linear relationships and interactions. We tune:
+
+-   **`mtry`**: predictors sampled per split.
+-   **`min_n`**: minimum observations in leaf nodes.
+-   **`trees`**: fixed at `r RF_TREES`.
+
+```{r fit-rf, cache=TRUE}
+prepped  <- prep(base_recipe)
+n_preds  <- ncol(bake(prepped, new_data = NULL)) - 1
+
+set.seed(SEED)
+rf_grid <- grid_latin_hypercube(
+  mtry(range = c(2L, max(2L, n_preds))), min_n(), size = RF_GRID)
+
+set.seed(SEED)
+rf_tune <- tune_grid(rf_wf, resamples = cv_folds, grid = rf_grid,
+                      metrics = class_metrics,
+                      control = control_grid(save_pred = TRUE))
+
+show_best(rf_tune, metric = "roc_auc", n = 5) %>%
+  select(mtry, min_n, mean, std_err) %>%
+  kable(caption = "Table 4: Top 5 Random Forest by ROC AUC", digits = 4)
+```
+
+```{r rf-plot, fig.cap="Figure 6: Random forest tuning results."}
+autoplot(rf_tune, metric = "roc_auc") +
+  labs(title = "Random Forest Tuning: ROC AUC") + theme_minimal()
+```
+
+## Model 4: XGBoost (Gradient-Boosted Trees)
+
+XGBoost builds trees sequentially --- each corrects errors of the previous. We tune:
+
+-   **`trees`**: boosting iterations.
+-   **`learn_rate`** ($\eta$): step size per iteration.
+-   **`tree_depth`**: maximum tree depth.
+-   **`min_n`**: minimum observations in leaf nodes.
+
+```{r fit-xgb, cache=TRUE}
+set.seed(SEED)
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(100L, 800L)),
+  learn_rate(range = c(-3, -1)),
+  tree_depth(range = c(3L, 10L)),
+  min_n(range = c(5L, 40L)),
+  size = XGB_GRID)
+
+set.seed(SEED)
+xgb_tune <- tune_grid(xgb_wf, resamples = cv_folds, grid = xgb_grid,
+                       metrics = class_metrics,
+                       control = control_grid(save_pred = TRUE))
+
+show_best(xgb_tune, metric = "roc_auc", n = 5) %>%
+  select(trees, learn_rate, tree_depth, min_n, mean, std_err) %>%
+  kable(caption = "Table 5: Top 5 XGBoost by ROC AUC", digits = 4)
+```
+
+```{r xgb-plot, fig.cap="Figure 7: XGBoost tuning results."}
+autoplot(xgb_tune, metric = "roc_auc") +
+  labs(title = "XGBoost Tuning: ROC AUC") + theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Model Selection and Performance
+
+## Cross-Validation Comparison
+
+We use **ROC AUC** as the primary metric because it evaluates ranking quality across all thresholds, not just the default 0.5 cutoff.
+
+```{r cv-comparison}
+best_row <- function(tune_res, label) {
+  metrics <- c("roc_auc", "accuracy", "sensitivity", "specificity")
+  map_dfr(metrics, ~ show_best(tune_res, metric = .x, n = 1)) %>%
+    distinct(.metric, .keep_all = TRUE) %>% mutate(model = label)
+}
+
+cv_comparison <- bind_rows(
+  collect_metrics(logistic_cv) %>% mutate(model = "Logistic Regression"),
+  best_row(glmnet_tune, "Elastic Net"),
+  best_row(rf_tune, "Random Forest"),
+  best_row(xgb_tune, "XGBoost")
+) %>%
+  select(model, .metric, mean, std_err) %>%
+  distinct(model, .metric, .keep_all = TRUE) %>%
+  arrange(.metric, desc(mean))
+
+cv_comparison %>%
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) %>%
+  kable(caption = "Table 6: CV Performance — All 4 Models", digits = 4)
+```
+
+```{r cv-plot, fig.cap="Figure 8: Cross-validation performance comparison."}
+cv_comparison %>%
+  ggplot(aes(x = reorder(model, mean), y = mean, fill = model)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), width = 0.2) +
+  facet_wrap(~ .metric, scales = "free_y", ncol = 2) +
+  coord_flip() +
+  scale_fill_manual(values = c("#2166AC", "#4393C3", "#D6604D", "#F4A582")) +
+  labs(title = "Cross-Validation Comparison (4 Models)", x = NULL, y = "Value") +
+  theme_minimal(base_size = 12)
+```
+
+```{r select-best}
+best_roc <- cv_comparison %>% filter(.metric == "roc_auc") %>% arrange(desc(mean))
+best_model_name   <- best_roc$model[1]
+second_model_name <- best_roc$model[2]
+cat("Best model:  ", best_model_name, "\n")
+cat("Runner-up:   ", second_model_name, "\n")
+```
+
+Based on cross-validation, **`r best_model_name`** achieved the highest ROC AUC, followed by **`r second_model_name`**.
+
+## Test Set Evaluation
+
+Per best practices and the course rubric, we evaluate only the **top two models** on the held-out test set.
+
+```{r test-eval}
+finalize_eval <- function(model_name) {
+  if (model_name == "Logistic Regression") {
+    last_fit(logistic_wf, split = data_split, metrics = class_metrics)
+  } else if (model_name == "Elastic Net") {
+    bp <- select_best(glmnet_tune, metric = "roc_auc")
+    last_fit(finalize_workflow(glmnet_wf, bp), split = data_split, metrics = class_metrics)
+  } else if (model_name == "Random Forest") {
+    bp <- select_best(rf_tune, metric = "roc_auc")
+    last_fit(finalize_workflow(rf_wf, bp), split = data_split, metrics = class_metrics)
+  } else {
+    bp <- select_best(xgb_tune, metric = "roc_auc")
+    last_fit(finalize_workflow(xgb_wf, bp), split = data_split, metrics = class_metrics)
+  }
+}
+
+final_fit  <- finalize_eval(best_model_name)
+second_fit <- finalize_eval(second_model_name)
+
+test_comparison <- bind_rows(
+  collect_metrics(final_fit)  %>% mutate(model = best_model_name),
+  collect_metrics(second_fit) %>% mutate(model = second_model_name)
+) %>% select(model, .metric, .estimate)
+
+test_wide <- test_comparison %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+kable(test_wide, caption = "Table 7: Test Set — Top 2 Models", digits = 4)
+```
+
+```{r test-plot, fig.cap="Figure 9: Test set performance (top 2 models)."}
+test_comparison %>%
+  ggplot(aes(x = reorder(model, .estimate), y = .estimate, fill = model)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~ .metric, scales = "free_y", ncol = 2) +
+  coord_flip() +
+  scale_fill_manual(values = c("#2166AC", "#D6604D")) +
+  labs(title = "Test Set Performance (Top 2 Models)", x = NULL, y = "Value") +
+  theme_minimal(base_size = 12)
+```
+
+## Best Model: `r best_model_name`
+
+### Confusion Matrix
+
+```{r confusion-matrix, fig.cap="Figure 10: Confusion matrix on the test set."}
+test_preds   <- collect_predictions(final_fit)
+conf_mat_obj <- conf_mat(test_preds, truth = !!sym(TARGET), estimate = .pred_class)
+
+autoplot(conf_mat_obj, type = "heatmap") +
+  labs(title = paste("Confusion Matrix —", best_model_name)) +
+  theme_minimal(base_size = 13)
+```
+
+```{r confusion-numbers}
+cm <- conf_mat_obj$table
+cat("True Positives (Win → Win):  ", cm[1,1], "\n")
+cat("True Negatives (Loss → Loss):", cm[2,2], "\n")
+cat("False Positives (Loss → Win):", cm[1,2], "\n")
+cat("False Negatives (Win → Loss):", cm[2,1], "\n")
+```
+
+### ROC Curve
+
+The ROC curve plots sensitivity vs. (1 - specificity) at every threshold. AUC = 0.5 is random guessing; AUC = 1.0 is perfect.
+
+```{r roc-curve, fig.cap="Figure 11: ROC curve on the test set."}
+pos_class <- levels(test_preds[[TARGET]])[1]
+prob_col  <- paste0(".pred_", pos_class)
+
+test_preds %>%
+  roc_curve(truth = !!sym(TARGET), !!sym(prob_col)) %>%
+  autoplot() +
+  labs(title = paste("ROC Curve —", best_model_name),
+       subtitle = paste("Positive class:", pos_class)) +
+  theme_minimal(base_size = 13)
+```
+
+### Variable Importance
+
+```{r vip-plot, fig.cap="Figure 12: Top 15 most important predictors."}
+tryCatch({
+  vip(extract_fit_parsnip(final_fit), num_features = 15) +
+    labs(title = paste("Variable Importance —", best_model_name)) +
+    theme_minimal(base_size = 12)
+}, error = function(e) cat("VIP not available for this model type."))
+```
+
+The most important predictors align with domain knowledge: gold, objective control (towers, dragons, baron), and combat stats (kills, damage) rank highest. Teams that accumulate more resources and secure more objectives tend to win --- confirming the inferential goal of this project.
+
+### Odds Ratios (Logistic Models Only)
+
+```{r odds-ratios}
+if (grepl("Logistic|Elastic", best_model_name)) {
+  tryCatch({
+    tidy_model <- tidy(extract_fit_parsnip(final_fit))
+    odds_ratios <- tidy_model %>%
+      mutate(odds_ratio = exp(estimate)) %>%
+      arrange(desc(abs(estimate)))
+    odds_ratios %>% head(15) %>%
+      select(term, estimate, odds_ratio, p.value) %>%
+      kable(caption = "Table 8: Top 15 Odds Ratios", digits = 4)
+  }, error = function(e) cat("Could not compute odds ratios:", conditionMessage(e)))
+} else {
+  cat("Odds ratios apply to logistic models only. For tree-based models we use",
+      "variable importance (above) instead.")
+}
+```
+
+`r if (grepl("Logistic|Elastic", best_model_name)) "An odds ratio > 1 means a one-SD increase in that predictor raises the odds of winning; < 1 means it lowers them. Magnitudes are comparable because all predictors are normalized." else ""`
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+## Summary of Results
+
+We built and compared four classification models to predict League of Legends match outcomes:
+
+1.  **Logistic Regression** --- simple, interpretable baseline.
+2.  **Elastic Net** --- adds regularization for multicollinearity and feature selection.
+3.  **Random Forest** --- non-linear ensemble capturing interactions.
+4.  **XGBoost** --- gradient-boosted trees, strong on tabular data.
+
+After `r CV_FOLDS`-fold cross-validation, **`r best_model_name`** achieved the best ROC AUC. On the held-out test set:
+
+```{r final-numbers}
+test_metrics <- collect_metrics(final_fit)
+test_auc <- test_metrics %>% filter(.metric == "roc_auc") %>% pull(.estimate)
+test_acc <- test_metrics %>% filter(.metric == "accuracy") %>% pull(.estimate)
+cat("Best model:", best_model_name, "\n")
+cat("Test ROC AUC:", round(test_auc, 4), "\n")
+cat("Test Accuracy:", round(test_acc, 4), "\n")
+```
+
+## What Worked Well
+
+-   **The tidymodels recipe** provided consistent preprocessing (imputation, encoding, correlation filtering, normalization) across all four models.
+-   **Stratified sampling** in both the train/test split and cross-validation ensured balanced class representation throughout.
+-   **Comparing four model types** --- from simple to complex --- gave confidence that the chosen model genuinely performs best and is not an artifact of a single evaluation.
+-   **Data integration**: Merging six raw files into one clean modeling table required careful attention to keys, types, and aggregation levels. Documenting this process was itself a valuable part of the project.
+
+## Surprises and Challenges
+
+-   **Multicollinearity was pervasive.** Gold, kills, CS, and damage move together. Correlation filtering and regularization were essential.
+-   **Simple models were competitive.** Logistic regression performed surprisingly well, suggesting the win/loss boundary is largely linear in this feature space.
+-   **Type mismatches across files** --- `stats1.csv` and `stats2.csv` had columns parsed as different types, requiring explicit coercion before combining.
+-   **Patch variability** --- the game changes with each patch, introducing noise no model can fully capture.
+
+## Limitations
+
+-   **Aggregated stats only.** We use full-game totals; early-game vs. late-game dynamics are lost.
+-   **No champion identity.** Team composition (a major factor in competitive play) is not included.
+-   **Post-game leakage risk.** Total gold and final tower counts reflect the entire match. Early-game snapshots would be more realistic for prediction.
+
+## Next Steps
+
+-   **Early-game features** (gold/objectives at 10--15 minutes) for live prediction.
+-   **Champion composition** features (team synergy, counter-picks).
+-   **Additional models** such as SVMs or neural networks.
+-   **Live deployment** as a real-time win-probability estimator.
+
+------------------------------------------------------------------------
+
+# Reproducibility
+
+```{r save-outputs, include=FALSE}
+# Save key outputs for reference
+saveRDS(final_fit, file.path(OUTPUT_DIR, "final_model_fit.rds"))
+write_csv(cv_comparison, file.path(OUTPUT_DIR, "cv_comparison.csv"))
+write_csv(test_wide, file.path(OUTPUT_DIR, "test_comparison.csv"))
+```
+
+All code is contained in this single `.Rmd` file. To reproduce:
+
+1.  Open `final_project.Rproj` in RStudio.
+2.  Install packages: `install.packages(c("tidyverse", "tidymodels", "glmnet", "ranger", "xgboost", "vip", "corrplot", "here", "rmarkdown", "knitr"))`.
+3.  Knit this file (Ctrl+Shift+K) or run `rmarkdown::render("report/final_report.Rmd")`.
+
+```{r session-info}
+sessionInfo()
+```

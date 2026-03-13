@@ -1,0 +1,24 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+
+# renv library (large; renv.lock is sufficient to restore)
+renv/library/
+renv/staging/
+renv/cellar/
+renv/local/
+renv/python/
+
+# Knitted output (regenerable)
+report/*.html
+report/*.pdf
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large data files (exceed GitHub 100MB limit)
+data/*.csv
