@@ -17,17 +17,13 @@ library(knitr)
 
 # Overview
 
-This codebook describes every column in the final modeling dataset for the
-League of Legends win/loss classification project.
+This codebook describes every column in the final modeling dataset for the League of Legends win/loss classification project.
 
 **Data source:**
 
-> Paololol. (2018). *League of Legends Ranked Matches.* Kaggle.
-> <https://www.kaggle.com/datasets/paololol/league-of-legends-ranked-matches>
+> Paololol. (2018). *League of Legends Ranked Matches.* Kaggle. <https://www.kaggle.com/datasets/paololol/league-of-legends-ranked-matches>
 
-The modeling table is created by merging `matches.csv`, `teamstats.csv`,
-`stats1.csv`, `stats2.csv`, and `participants.csv`. Each row represents
-**one team in one match**.
+The modeling table is created by merging `matches.csv`, `teamstats.csv`, `stats1.csv`, `stats2.csv`, and `participants.csv`. Each row represents **one team in one match**.
 
 ```{r load-data}
 prepared_path <- here("data", "prepared_data.csv")
@@ -40,24 +36,24 @@ if (file.exists(prepared_path)) {
 
 # Target Variable
 
-| Field | Value |
-|-------|-------|
-| **Column** | `win` |
-| **Type** | Integer (0/1), converted to Factor for modeling |
-| **Values** | `1` = Win, `0` = Loss |
-| **Description** | Whether the team won the match |
+| Field           | Value                                           |
+|-----------------|-------------------------------------------------|
+| **Column**      | `win`                                           |
+| **Type**        | Integer (0/1), converted to Factor for modeling |
+| **Values**      | `1` = Win, `0` = Loss                           |
+| **Description** | Whether the team won the match                  |
 
 # Match-Level Variables
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `duration` | Integer | Match duration in seconds |
+| Column     | Type    | Description                         |
+|------------|---------|-------------------------------------|
+| `duration` | Integer | Match duration in seconds           |
 | `seasonid` | Integer | Riot Games ranked season identifier |
 
 # Team Objective Variables (from `teamstats.csv`)
 
 | Column | Type | Values | Description |
-|--------|------|--------|-------------|
+|----|----|----|----|
 | `firstblood` | Binary | 0, 1 | 1 = team scored first kill of the match |
 | `firsttower` | Binary | 0, 1 | 1 = team destroyed first tower |
 | `firstinhib` | Binary | 0, 1 | 1 = team destroyed first inhibitor |
@@ -73,7 +69,7 @@ if (file.exists(prepared_path)) {
 # Aggregated Player Statistics (summed across 5 team members)
 
 | Column | Type | Description |
-|--------|------|-------------|
+|----|----|----|
 | `team_kills` | Integer | Total kills |
 | `team_deaths` | Integer | Total deaths |
 | `team_assists` | Integer | Total assists |
@@ -122,8 +118,8 @@ kable(codebook, caption = "All Columns — Summary")
 
 # Notes
 
-- **Binary flags** (0/1): `1` = team achieved that objective; `0` = they did not.
-- **"Harry"** is Riot's internal codename for the **Rift Herald**.
-- **Aggregation**: Player stats are summed per team; `avg_champlvl` is the mean.
-- **Missingness**: Imputed in the modeling recipe (median for numeric, mode for categorical).
-- **Leakage prevention**: `matchid`, `teamid`, and any column with "win/loss/result" (other than target) are removed.
+-   **Binary flags** (0/1): `1` = team achieved that objective; `0` = they did not.
+-   **"Harry"** is Riot's internal codename for the **Rift Herald**.
+-   **Aggregation**: Player stats are summed per team; `avg_champlvl` is the mean.
+-   **Missingness**: Imputed in the modeling recipe (median for numeric, mode for categorical).
+-   **Leakage prevention**: `matchid`, `teamid`, and any column with "win/loss/result" (other than target) are removed.

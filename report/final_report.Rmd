@@ -3,6 +3,11 @@ title: "Predicting Match Outcomes in League of Legends: A Classification Approac
 author: "PSTAT 131/231 Final Project"
 date: "`r Sys.Date()`"
 output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    fig_width: 8
+    fig_height: 5
   html_document:
     toc: true
     toc_float: true
@@ -11,11 +16,6 @@ output:
     code_folding: show
     fig_width: 10
     fig_height: 6
-  pdf_document:
-    toc: true
-    toc_depth: 3
-    fig_width: 8
-    fig_height: 5
 ---
 
 ```{r setup, include=FALSE}
@@ -37,19 +37,35 @@ library(knitr)
 library(here)
 
 tidymodels_prefer()
+
+# ---- Custom ggplot theme & palette ----
+theme_lol <- function() {
+  theme_minimal(base_size = 14) %+replace%
+    theme(
+      plot.title   = element_text(face = "bold", size = 16),
+      axis.title   = element_text(size = 13),
+      axis.text    = element_text(size = 11),
+      strip.text   = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+COL_WIN  <- "#0AC8B9"
+COL_LOSS <- "#C8102E"
+COL_FILL <- "#0AC8B9"
 ```
 
 ```{r global-config}
 # ---- Global Configuration ----
-SEED         <- 42
+SEED         <- 123
 set.seed(SEED)
 
 DATA_DIR     <- here("data")
 OUTPUT_DIR   <- here("output")
 if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 
-TRAIN_PROP   <- 0.75
-CV_FOLDS     <- 10
+TRAIN_PROP   <- 0.80
+CV_FOLDS     <- 5
 RF_TREES     <- 500
 
 GLMNET_GRID  <- 20
@@ -57,7 +73,7 @@ RF_GRID      <- 15
 XGB_GRID     <- 20
 
 # Set to a number (e.g., 50000) for faster test runs; NULL uses all data.
-SAMPLE_N     <- NULL
+SAMPLE_N     <- 50000
 ```
 
 ------------------------------------------------------------------------
@@ -66,9 +82,9 @@ SAMPLE_N     <- NULL
 
 League of Legends (LoL) is one of the most popular competitive online multiplayer games in the world, with millions of ranked matches played each day. In each match, two teams of five players compete to destroy the opposing team's base (the "Nexus"). Along the way, teams earn **gold** by killing enemy players and minions, secure **objectives** like dragons, Baron Nashor, Rift Herald, and towers, and deal **damage** to push toward the enemy base. The team that manages its resources and objectives most effectively typically wins.
 
-The central research question of this project is: **Can we accurately predict whether a team wins or loses a ranked League of Legends match using in-game performance statistics?** Secondarily, we want to understand which in-game factors --- such as gold earned, kills, objective control, and vision --- are the strongest predictors of winning.
+The research question of this project is: **Can we accurately predict whether a team wins or loses a ranked League of Legends match using in-game performance statistics?** Secondarily, we want to understand which in-game factors such as gold earned, kills, objective control, and vision are the strongest predictors of winning.
 
-This is a **binary classification** problem because the outcome variable can take only two values: Win or Loss. We use four classification models --- logistic regression, elastic net, random forest, and XGBoost --- all implemented in the `tidymodels` framework with cross-validation for hyperparameter tuning and stratified sampling to ensure balanced representation of both classes.
+This is a **classification** problem because the outcome variable can take only two values: Win or Loss. We use four classification models logistic regression, elastic net, random forest, and XGBoost all implemented in the `tidymodels` framework with cross-validation for hyperparameter tuning and stratified sampling to ensure balanced representation of both classes.
 
 ## Data Source and Citation
 
@@ -85,7 +101,7 @@ A substantial portion of this project involved cleaning, tidying, and combining 
 ## Raw File Structure
 
 | File | Level | Key Columns | Contents |
-|----------------|----------------|-----------------------|------------------|
+|----|----|----|----|
 | `matches.csv` | One row per match | `id` | Duration, season, platform, version |
 | `participants.csv` | One row per player per match | `id`, `matchid`, `player` | Champion, role, summoner spells |
 | `stats1.csv` + `stats2.csv` | One row per player per match | `id` (= participants.id) | Kills, deaths, gold, damage, wards, **win/loss** |
@@ -239,6 +255,10 @@ cat("Target:", TARGET, "\n")
 cat("Predictors:", ncol(clean_data) - 1, "\n")
 ```
 
+## Missing Data Assessment
+
+Before modeling, we check every column for missing values. Understanding the amount and pattern of missingness is important because many algorithms cannot handle `NA`s directly, and the choice of imputation method can affect model performance.
+
 ```{r missingness-report}
 miss_summary <- clean_data %>%
   summarise(across(everything(), ~ sum(is.na(.)))) %>%
@@ -254,22 +274,26 @@ if (nrow(miss_summary) == 0) {
 }
 ```
 
-`r if (nrow(miss_summary) == 0) "The prepared dataset is complete --- no columns contain missing values. Our recipe still includes imputation steps as a safety net for robustness." else paste0("There are ", nrow(miss_summary), " columns with missing values. Our recipe imputes numeric columns with the median and categorical columns with the mode.")`
+`r if (nrow(miss_summary) == 0) "The prepared dataset is complete --- no columns contain missing values. This is expected because the raw Kaggle files record full post-game statistics for every completed match; incomplete games are not included in the data. Despite the absence of missingness, our preprocessing recipe still includes median imputation for numeric predictors and mode imputation for categorical predictors as a safety net, ensuring the pipeline will not break if applied to new data with occasional gaps." else paste0("There are ", nrow(miss_summary), " columns with missing values. Missing numeric predictors are imputed with the column median, and missing categorical predictors are imputed with the mode. We chose median over mean imputation because several features are right-skewed (as shown in the EDA histograms), and the median is more robust to outliers.")`
 
 ------------------------------------------------------------------------
 
 # Exploratory Data Analysis
 
+Before fitting any models, we explore the dataset to understand the target distribution, predictor shapes, inter-variable correlations, and which features separate wins from losses. These insights guide our preprocessing choices (normalization, correlation filtering) and set expectations for model performance. Im honestly expecting a high amount of multicol.
+
 ## Outcome Balance
+
+The first step in any classification project is checking whether the outcome classes are balanced. An imbalanced target would require special handling such as oversampling, class weights, or alternative metrics.
 
 ```{r eda-balance, fig.cap="Figure 1: Distribution of the outcome variable (Win vs. Loss)."}
 clean_data %>%
   ggplot(aes(x = .data[[TARGET]], fill = .data[[TARGET]])) +
   geom_bar(alpha = 0.85, show.legend = FALSE) +
-  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
-  scale_fill_manual(values = c("#2166AC", "#B2182B")) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c(COL_WIN, COL_LOSS)) +
   labs(title = "Outcome Class Balance", x = TARGET, y = "Count") +
-  theme_minimal(base_size = 13)
+  theme_lol()
 ```
 
 ```{r balance-numbers}
@@ -278,9 +302,11 @@ cat("Win:", tbl["Win"], "(", round(100 * tbl["Win"] / sum(tbl), 1), "%)\n")
 cat("Loss:", tbl["Loss"], "(", round(100 * tbl["Loss"] / sum(tbl), 1), "%)\n")
 ```
 
-Because each match produces one winning team and one losing team, the classes are perfectly balanced (50/50). This is ideal --- we do not need oversampling or class weights. We still use stratified sampling in all splits.
+Because each match produces one winning team and one losing team, the classes are perfectly balanced (50/50). This is ideal --- we do not need oversampling or class weights.
 
 ## Distributions of Key Numeric Predictors
+
+Next, we examine the shape of the numeric predictors. We select the six highest-variance features because these carry the most spread and are most likely to differentiate teams. Understanding their distributions tells us whether normalization or transformation is needed.
 
 ```{r eda-distributions, fig.cap="Figure 2: Histograms of the highest-variance numeric predictors."}
 numeric_preds <- clean_data %>%
@@ -290,17 +316,17 @@ top_vars <- clean_data %>%
   select(all_of(numeric_preds)) %>%
   summarise(across(everything(), ~ var(., na.rm = TRUE))) %>%
   pivot_longer(everything()) %>% arrange(desc(value)) %>%
-  slice_head(n = min(8, length(numeric_preds))) %>% pull(name)
+  slice_head(n = min(6, length(numeric_preds))) %>% pull(name)
 
 clean_data %>%
   select(all_of(top_vars)) %>%
   pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = value)) +
-  geom_histogram(bins = 30, fill = "#4393C3", color = "white", alpha = 0.8) +
+  geom_histogram(bins = 30, fill = COL_FILL, color = "white", alpha = 0.8) +
   facet_wrap(~ variable, scales = "free", ncol = 2) +
   labs(title = "Distributions of Top Numeric Predictors (by Variance)",
        x = "Value", y = "Frequency") +
-  theme_minimal(base_size = 11)
+  theme_lol()
 ```
 
 Many game statistics follow right-skewed distributions because dominant performances produce extreme values in gold, damage, and kills. Our recipe normalizes all numeric predictors, which is important for logistic regression and elastic net.
@@ -323,12 +349,16 @@ corr_mat <- clean_data %>%
   cor(use = "pairwise.complete.obs")
 
 corrplot(corr_mat, method = "color", type = "upper", order = "hclust",
-         tl.cex = 0.65, tl.col = "black")
+         tl.cex = 0.75, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.6,
+         col = colorRampPalette(c("#2166AC", "white", "#C8102E"))(200))
 ```
 
 The heatmap reveals clusters of correlated features. Our recipe includes `step_corr(threshold = 0.90)` to remove one member of highly correlated pairs. Elastic net also handles collinearity by shrinking correlated coefficients.
 
 ## Top Predictors by Outcome
+
+To identify which features matter most for predicting the outcome, we select the six predictors with the highest absolute correlation to win/loss and compare their distributions across the two classes. Clear separation in a boxplot suggests strong predictive power.
 
 ```{r eda-boxplots, fig.cap="Figure 4: Boxplots of the most outcome-correlated predictors."}
 cors <- sapply(numeric_preds, function(v)
@@ -340,15 +370,17 @@ clean_data %>%
   pivot_longer(-all_of(TARGET), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = .data[[TARGET]], y = value, fill = .data[[TARGET]])) +
   geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
-  scale_fill_manual(values = c("#2166AC", "#B2182B")) +
+  scale_fill_manual(values = c(COL_WIN, COL_LOSS)) +
   facet_wrap(~ variable, scales = "free_y", ncol = 3) +
   labs(title = "Top Predictors by Outcome", x = TARGET, y = "Value") +
-  theme_minimal(base_size = 11) + theme(legend.position = "none")
+  theme_lol() + theme(legend.position = "none")
 ```
 
 Winning teams show clearly higher gold earned, more tower kills, and more damage dealt. This separation confirms that our features carry genuine predictive signal for the classification task.
 
 ## Summary Statistics
+
+Finally, we present descriptive statistics for the numeric predictors. This table provides a quick reference for the central tendency, spread, and range of each feature, helping to contextualize the patterns observed in the plots above.
 
 ```{r eda-summary-table}
 eda_summary <- clean_data %>%
@@ -367,13 +399,15 @@ kable(head(eda_summary, 20),
       caption = "Table 1: Summary statistics for numeric predictors (first 20).")
 ```
 
+The large standard deviations relative to the means for several features (e.g., total damage, gold earned) confirm the right-skewed distributions seen in Figure 2. The wide min--max ranges also highlight the presence of outlier performances. Centering and scaling in our recipe will bring all predictors onto a comparable scale, which is essential for logistic regression and elastic net.
+
 ------------------------------------------------------------------------
 
 # Data Splitting and Cross-Validation
 
 ## Splitting the Data
 
-We split the data into **75% training** and **25% test**, stratified on the outcome. The test set is held out entirely until final evaluation --- no model sees it during training or tuning.
+We split the data into **80% training** and **20% test**, stratified on the outcome. The full dataset contains 184,069 matches, which yields over 360,000 team-level observations (two rows per match). An 80/20 split maximizes training data while still reserving a large test set for reliable final evaluation. The test set is held out entirely until final evaluation --- no model sees it during training or tuning.
 
 ```{r data-split}
 set.seed(SEED)
@@ -475,6 +509,8 @@ collect_metrics(logistic_cv) %>%
   kable(caption = "Table 2: Logistic Regression — CV Results", digits = 4)
 ```
 
+Table 2 shows the cross-validation results for our baseline logistic regression model. Because this model has no hyperparameters to tune, these metrics reflect a straightforward fit across all folds. The results establish a performance floor that the more complex models should improve upon.
+
 ## Model 2: Elastic Net (Regularized Logistic Regression)
 
 Elastic net adds a penalty that shrinks coefficients, helping with multicollinearity. We tune:
@@ -501,6 +537,8 @@ autoplot(glmnet_tune, metric = "roc_auc") +
   labs(title = "Elastic Net Tuning: ROC AUC") + theme_minimal()
 ```
 
+Table 3 shows the top five elastic net configurations by ROC AUC, and Figure 5 visualizes how performance varies across the penalty and mixture grid. The best configurations tend to favor moderate regularization, confirming that some coefficient shrinkage helps with the multicollinearity present in our features.
+
 ## Model 3: Random Forest
 
 Random forests build hundreds of decision trees on bootstrapped samples and aggregate their votes. They naturally handle non-linear relationships and interactions. We tune:
@@ -511,7 +549,7 @@ Random forests build hundreds of decision trees on bootstrapped samples and aggr
 
 ```{r fit-rf, cache=TRUE}
 prepped  <- prep(base_recipe)
-n_preds  <- ncol(bake(prepped, new_data = NULL)) - 1
+n_preds  <- ncol(bake(prepped, new_data = head(train_data, 5))) - 1
 
 set.seed(SEED)
 rf_grid <- grid_latin_hypercube(
@@ -531,6 +569,8 @@ show_best(rf_tune, metric = "roc_auc", n = 5) %>%
 autoplot(rf_tune, metric = "roc_auc") +
   labs(title = "Random Forest Tuning: ROC AUC") + theme_minimal()
 ```
+
+Table 4 lists the top five random forest configurations, and Figure 6 shows how ROC AUC varies with `mtry` and `min_n`. Random forests are less sensitive to hyperparameter choices than elastic net, as reflected by the relatively flat performance surface across the grid.
 
 ## Model 4: XGBoost (Gradient-Boosted Trees)
 
@@ -564,6 +604,8 @@ show_best(xgb_tune, metric = "roc_auc", n = 5) %>%
 autoplot(xgb_tune, metric = "roc_auc") +
   labs(title = "XGBoost Tuning: ROC AUC") + theme_minimal()
 ```
+
+Table 5 presents the top five XGBoost configurations, and Figure 7 shows how performance responds to the four tuned hyperparameters. XGBoost is the most sensitive to tuning choices --- learning rate and tree depth in particular have a strong effect on AUC, which is why we use a larger grid (20 points) for this model.
 
 ------------------------------------------------------------------------
 
@@ -651,6 +693,8 @@ test_wide <- test_comparison %>%
 kable(test_wide, caption = "Table 7: Test Set — Top 2 Models", digits = 4)
 ```
 
+Table 7 reports the test set metrics for our two best models. These results are based on data the models have never seen during training or tuning, providing an unbiased estimate of real-world performance.
+
 ```{r test-plot, fig.cap="Figure 9: Test set performance (top 2 models)."}
 test_comparison %>%
   ggplot(aes(x = reorder(model, .estimate), y = .estimate, fill = model)) +
@@ -662,9 +706,13 @@ test_comparison %>%
   theme_minimal(base_size = 12)
 ```
 
+Figure 9 visualizes the comparison. If the two models perform similarly, both are strong candidates for deployment; if one clearly dominates, it validates our selection based on cross-validation.
+
 ## Best Model: `r best_model_name`
 
 ### Confusion Matrix
+
+We now examine the best model in detail, starting with the confusion matrix, which shows exactly where the model gets predictions right and wrong.
 
 ```{r confusion-matrix, fig.cap="Figure 10: Confusion matrix on the test set."}
 test_preds   <- collect_predictions(final_fit)
@@ -683,6 +731,8 @@ cat("False Positives (Loss → Win):", cm[1,2], "\n")
 cat("False Negatives (Win → Loss):", cm[2,1], "\n")
 ```
 
+The confusion matrix shows how predictions are distributed across the four possible outcomes. A strong classifier will concentrate counts along the diagonal (true positives and true negatives) with relatively few off-diagonal errors.
+
 ### ROC Curve
 
 The ROC curve plots sensitivity vs. (1 - specificity) at every threshold. AUC = 0.5 is random guessing; AUC = 1.0 is perfect.
@@ -699,7 +749,11 @@ test_preds %>%
   theme_minimal(base_size = 13)
 ```
 
+A curve that hugs the top-left corner indicates strong discrimination between wins and losses. The farther the curve is from the diagonal (random guessing), the better the model separates the two classes at every possible decision threshold.
+
 ### Variable Importance
+
+Beyond raw performance, we want to understand which features the model relies on most. Variable importance tells us which predictors contribute the most to the model's decisions.
 
 ```{r vip-plot, fig.cap="Figure 12: Top 15 most important predictors."}
 tryCatch({
@@ -738,14 +792,7 @@ if (grepl("Logistic|Elastic", best_model_name)) {
 
 ## Summary of Results
 
-We built and compared four classification models to predict League of Legends match outcomes:
-
-1.  **Logistic Regression** --- simple, interpretable baseline.
-2.  **Elastic Net** --- adds regularization for multicollinearity and feature selection.
-3.  **Random Forest** --- non-linear ensemble capturing interactions.
-4.  **XGBoost** --- gradient-boosted trees, strong on tabular data.
-
-After `r CV_FOLDS`-fold cross-validation, **`r best_model_name`** achieved the best ROC AUC. On the held-out test set:
+We built and compared four classification models to predict League of Legends match outcomes: logistic regression as a simple interpretable baseline, elastic net for regularization and feature selection, random forest as a non-linear ensemble, and XGBoost as a gradient-boosted tree model. All four were trained using the same preprocessing recipe and evaluated with `r CV_FOLDS`-fold stratified cross-validation. After comparing CV performance, **`r best_model_name`** achieved the highest ROC AUC, followed by **`r second_model_name`** as the runner-up. Only these top two models were evaluated on the held-out test set.
 
 ```{r final-numbers}
 test_metrics <- collect_metrics(final_fit)
@@ -756,32 +803,17 @@ cat("Test ROC AUC:", round(test_auc, 4), "\n")
 cat("Test Accuracy:", round(test_acc, 4), "\n")
 ```
 
-## What Worked Well
+The tidymodels framework provided a consistent pipeline across all four models, with shared preprocessing steps for imputation, dummy encoding, correlation filtering, and normalization. Stratified sampling in both the train/test split and cross-validation ensured balanced class representation throughout the analysis. Comparing four model types --- from simple to complex --- gave us confidence that the chosen model genuinely performs best and is not an artifact of a single evaluation method. The data integration process itself was a substantial part of the project, as merging six raw CSV files into a single modeling table required careful attention to keys, type mismatches, and aggregation levels.
 
--   **The tidymodels recipe** provided consistent preprocessing (imputation, encoding, correlation filtering, normalization) across all four models.
--   **Stratified sampling** in both the train/test split and cross-validation ensured balanced class representation throughout.
--   **Comparing four model types** --- from simple to complex --- gave confidence that the chosen model genuinely performs best and is not an artifact of a single evaluation.
--   **Data integration**: Merging six raw files into one clean modeling table required careful attention to keys, types, and aggregation levels. Documenting this process was itself a valuable part of the project.
+## Challenges and Limitations
 
-## Surprises and Challenges
+One of the biggest challenges was multicollinearity among the predictors. Gold earned, kills, assists, CS, and damage all move together because those activities generate gold, which meant that correlation filtering and regularization were essential preprocessing steps. We also encountered type mismatches between `stats1.csv` and `stats2.csv`, where identical columns were parsed as different types, requiring explicit coercion before the files could be combined. Additionally, the game changes with each patch, introducing noise that no model can fully capture.
 
--   **Multicollinearity was pervasive.** Gold, kills, CS, and damage move together. Correlation filtering and regularization were essential.
--   **Simple models were competitive.** Logistic regression performed surprisingly well, suggesting the win/loss boundary is largely linear in this feature space.
--   **Type mismatches across files** --- `stats1.csv` and `stats2.csv` had columns parsed as different types, requiring explicit coercion before combining.
--   **Patch variability** --- the game changes with each patch, introducing noise no model can fully capture.
+The primary limitation of this analysis is that we use full-game aggregated statistics rather than time-stamped snapshots. This means early-game versus late-game dynamics are lost, and features like total gold and final tower count reflect the entire match outcome rather than a mid-game state. Furthermore, team composition --- which champion each player selected --- is not included as a predictor, despite being a major factor in competitive play. These aggregated post-game stats carry some inherent leakage risk, since they are influenced by whether the team ultimately won or lost.
 
-## Limitations
+## Future Work
 
--   **Aggregated stats only.** We use full-game totals; early-game vs. late-game dynamics are lost.
--   **No champion identity.** Team composition (a major factor in competitive play) is not included.
--   **Post-game leakage risk.** Total gold and final tower counts reflect the entire match. Early-game snapshots would be more realistic for prediction.
-
-## Next Steps
-
--   **Early-game features** (gold/objectives at 10--15 minutes) for live prediction.
--   **Champion composition** features (team synergy, counter-picks).
--   **Additional models** such as SVMs or neural networks.
--   **Live deployment** as a real-time win-probability estimator.
+There are several promising directions for extending this project. Incorporating early-game features such as gold differential and objective control at the 10- to 15-minute mark would enable live win-probability prediction during a match rather than relying on post-game totals. Adding champion composition features --- capturing team synergy, counter-picks, and role balance --- could substantially improve model accuracy, as drafting is a critical component of competitive play. From a modeling perspective, exploring support vector machines or neural networks could reveal whether more complex decision boundaries improve upon the tree-based models. Ultimately, the goal would be to deploy a real-time win-probability estimator that updates as a match progresses, similar to the tools used by professional League of Legends broadcast analysts.
 
 ------------------------------------------------------------------------
 
