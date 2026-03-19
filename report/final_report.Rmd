@@ -72,8 +72,8 @@ GLMNET_GRID  <- 20
 RF_GRID      <- 15
 XGB_GRID     <- 20
 
-# Set to a number (e.g., 50000) for faster test runs; NULL uses all data.
-SAMPLE_N     <- 50000
+# Set to a number (e.g., 5000) if I did null it would use all data thats too long
+SAMPLE_N     <- 5000
 ```
 
 ------------------------------------------------------------------------
@@ -101,7 +101,7 @@ A substantial portion of this project involved cleaning, tidying, and combining 
 ## Raw File Structure
 
 | File | Level | Key Columns | Contents |
-|----|----|----|----|
+|------------------|------------------|------------------|------------------|
 | `matches.csv` | One row per match | `id` | Duration, season, platform, version |
 | `participants.csv` | One row per player per match | `id`, `matchid`, `player` | Champion, role, summoner spells |
 | `stats1.csv` + `stats2.csv` | One row per player per match | `id` (= participants.id) | Kills, deaths, gold, damage, wards, **win/loss** |
@@ -216,9 +216,33 @@ Data leakage occurs when information that would not be available at prediction t
 -   **Other win/loss columns**: Our pipeline automatically removes any column whose name contains "win," "loss," "result," "victory," or "defeat" (other than the target).
 -   **Post-game aggregates**: Stats like total gold and final tower count reflect the entire game. Ideally we would use only early/mid-game snapshots, but the dataset does not provide time-stamped data. We note this as a limitation.
 
+We apply several additional cleaning steps before modeling. Games under 5 minutes are almost certainly remakes (matches restarted due to disconnects or bugs) and do not reflect real gameplay. Games over 60 minutes are extreme outliers that may skew model training. We also check for and remove any duplicate rows.
+
 ```{r clean-data}
 TARGET <- "win"
 clean_data <- prepared_data
+cat("Starting rows:", nrow(clean_data), "\n")
+
+# Remove remakes and abnormally short games (< 5 minutes / 300 seconds)
+if ("duration" %in% names(clean_data)) {
+  n_before <- nrow(clean_data)
+  clean_data <- clean_data %>% filter(duration >= 300)
+  cat("Dropped", n_before - nrow(clean_data), "rows with duration < 5 min (remakes)\n")
+}
+
+# Remove abnormally long games (> 60 minutes / 3600 seconds)
+if ("duration" %in% names(clean_data)) {
+  n_before <- nrow(clean_data)
+  clean_data <- clean_data %>% filter(duration <= 3600)
+  cat("Dropped", n_before - nrow(clean_data), "rows with duration > 60 min (outliers)\n")
+}
+
+# Remove duplicate rows (if any)
+n_before <- nrow(clean_data)
+clean_data <- distinct(clean_data)
+cat("Dropped", n_before - nrow(clean_data), "duplicate rows\n")
+
+cat("Rows after cleaning:", nrow(clean_data), "\n")
 
 # Optional: sample for faster runs
 if (!is.null(SAMPLE_N) && SAMPLE_N < nrow(clean_data)) {
