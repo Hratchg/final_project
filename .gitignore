@@ -20,5 +20,5 @@ report/*.pdf
 .DS_Store
 Thumbs.db
 
-# Large data files (exceed GitHub 100MB limit)
-data/*.csv
+# Large data files tracked via Git LFS
+# data/*.csv
